@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from "@nestjs/common"
+import { ConflictException, Injectable, Logger, NotFoundException } from "@nestjs/common"
 import { createPaginator, PaginateOptions } from "prisma-pagination"
 import { InjectStripeClient } from "@golevelup/nestjs-stripe"
 import { ConfigService } from "@nestjs/config"
@@ -7,6 +7,7 @@ import Stripe from "stripe"
 import { getCurrentSubscriptionPeriods } from "../utils/get-stripe-current-subscription-periods.util"
 import { getStripeSubscriptionItemId } from "../utils/get-stripe-subscription-item-id.util"
 import { DiscordWebhookService } from "../discord-webhook/discord-webhook.service"
+import { isSubscriptionEntitled } from "../utils/subscription-entitlement.util"
 import { messagesHelper } from "../helpers/messages.helper"
 import { generateApiKey } from "../utils/generate-api-key"
 import { Prisma, User } from "../generated/prisma/client"
@@ -23,8 +24,15 @@ type StripeCustomerAndSubscription = {
     subscription: Stripe.Subscription
 }
 
+const sensitiveFields = {
+    password: true,
+    apiKey: true,
+} as const
+
 @Injectable()
 export class UsersService {
+    private readonly logger = new Logger(UsersService.name)
+
     constructor(
         private readonly discordWebhookService: DiscordWebhookService,
         @InjectStripeClient() private readonly stripe: Stripe,
@@ -35,10 +43,9 @@ export class UsersService {
     ) {}
 
     private async validateNewUser(email: string, username: string): Promise<void> {
-        const existingUser = await this.prisma.user.findUnique({
+        const existingUser = await this.prisma.user.findFirst({
             where: {
-                email: email,
-                username: username,
+                OR: [{ email: email }, { username: username }],
             },
             select: {
                 email: true,
@@ -60,40 +67,64 @@ export class UsersService {
         }
     }
 
+    private async findPlanOrThrow(planId: string) {
+        const plan = await this.prisma.plan.findUnique({
+            where: {
+                id: planId,
+            },
+        })
+
+        if (!plan) {
+            throw new NotFoundException(
+                messagesHelper.OBJECT_NOT_FOUND({
+                    name: "Plan",
+                    property: "id",
+                    value: planId,
+                }),
+            )
+        }
+
+        return plan
+    }
+
     private async handleStripeCustomerAndSubscription(
         createUserDto: CreateUserDto,
         externalPriceId: string,
     ): Promise<StripeCustomerAndSubscription> {
-        const existingCustomers = await this.stripe.customers.list({
+        // Sempre cria um cliente novo: reaproveitar um cliente existente pelo email (que não é verificado)
+        // permitiria vincular a conta de outra pessoa (e seus métodos de pagamento) a este usuário.
+        const customer = await this.stripe.customers.create({
             email: createUserDto.email,
-            limit: 1,
+            name: createUserDto.name,
+            metadata: {
+                ...(createUserDto.planId && { planId: createUserDto.planId }),
+                ...(createUserDto.supabaseId && { supabaseId: createUserDto.supabaseId }),
+            },
         })
 
-        let customer: Stripe.Customer
-
-        if (existingCustomers.data.length > 0) {
-            customer = existingCustomers.data[0]
-        } else {
-            customer = await this.stripe.customers.create({
-                email: createUserDto.email,
-                name: createUserDto.name,
-                metadata: {
-                    ...(createUserDto.planId && { planId: createUserDto.planId }),
-                    ...(createUserDto.supabaseId && { supabaseId: createUserDto.supabaseId }),
-                },
+        try {
+            const subscription = await this.stripe.subscriptions.create({
+                customer: customer.id,
+                items: [
+                    {
+                        price: externalPriceId,
+                    },
+                ],
             })
+
+            return { customer, subscription }
+        } catch (error) {
+            await this.safeDeleteStripeCustomer(customer.id)
+            throw error
         }
+    }
 
-        const subscription = await this.stripe.subscriptions.create({
-            customer: customer.id,
-            items: [
-                {
-                    price: externalPriceId,
-                },
-            ],
-        })
-
-        return { customer, subscription }
+    private async safeDeleteStripeCustomer(customerId: string) {
+        try {
+            await this.stripe.customers.del(customerId)
+        } catch (error) {
+            this.logger.error(`Failed to delete orphan Stripe customer ${customerId}`, error)
+        }
     }
 
     private async sendWelcomeNotifications(user: UserWithoutSensitiveInfo): Promise<void> {
@@ -114,14 +145,21 @@ export class UsersService {
     }
 
     async create(createUserDto: CreateUserDto) {
-        const { password, ...rest } = createUserDto
+        const { password, planId: requestedPlanId, ...rest } = createUserDto
 
         await this.validateNewUser(createUserDto.email, createUserDto.username)
 
+        const plan = await this.findPlanOrThrow(requestedPlanId)
+
         const { customer, subscription } = await this.handleStripeCustomerAndSubscription(
             createUserDto,
-            configHelper.plans.free.id,
+            plan.externalPriceId,
         )
+
+        // O plano só é liberado se a assinatura estiver realmente ativa (ex.: preço gratuito).
+        // Assinaturas pagas sem pagamento ficam "incomplete" e o usuário permanece no plano gratuito
+        // até o webhook do Stripe confirmar o pagamento.
+        const planId = isSubscriptionEntitled(subscription.status) ? plan.id : configHelper.plans.free.id
 
         const subscriptionItemId = getStripeSubscriptionItemId(subscription)
         const { currentPeriodEnd, currentPeriodStart } = getCurrentSubscriptionPeriods(subscription)
@@ -130,31 +168,37 @@ export class UsersService {
         const encryptedApiKey = this.cryptoService.encrypt(generatedApiKey)
         const hashedPassword = password ? await this.cryptoService.hashPassword(password) : null
 
-        const user = await this.prisma.user.create({
-            data: {
-                ...rest,
-                apiKey: encryptedApiKey,
-                password: hashedPassword,
-                stripeCustomerId: customer.id,
-                subscription: {
-                    create: {
-                        status: subscription.status,
-                        externalId: subscription.id,
-                        itemId: subscriptionItemId,
-                        currentPeriodEnd: currentPeriodEnd,
-                        currentPeriodStart: currentPeriodStart,
-                        cancelAtPeriodEnd: subscription.cancel_at_period_end,
-                        canceledAt: subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null,
-                        endedAt: subscription.ended_at ? new Date(subscription.ended_at * 1000) : null,
+        let user: UserWithoutSensitiveInfo
+
+        try {
+            user = await this.prisma.user.create({
+                data: {
+                    ...rest,
+                    planId: planId,
+                    apiKey: encryptedApiKey,
+                    password: hashedPassword,
+                    stripeCustomerId: customer.id,
+                    subscription: {
+                        create: {
+                            status: subscription.status,
+                            externalId: subscription.id,
+                            itemId: subscriptionItemId,
+                            currentPeriodEnd: currentPeriodEnd,
+                            currentPeriodStart: currentPeriodStart,
+                            cancelAtPeriodEnd: subscription.cancel_at_period_end,
+                            canceledAt: subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null,
+                            endedAt: subscription.ended_at ? new Date(subscription.ended_at * 1000) : null,
+                        },
                     },
+                    featureUsage: {},
                 },
-                featureUsage: {},
-            },
-            omit: {
-                password: true,
-                apiKey: true,
-            },
-        })
+                omit: sensitiveFields,
+            })
+        } catch (error) {
+            // Evita deixar cliente/assinatura órfãos no Stripe quando a gravação no banco falha.
+            await this.safeDeleteStripeCustomer(customer.id)
+            throw error
+        }
 
         this.sendWelcomeNotifications(user)
 
@@ -171,10 +215,7 @@ export class UsersService {
         })
 
         return await paginate<User, Prisma.UserFindManyArgs>(this.prisma.user, {
-            omit: {
-                password: true,
-                apiKey: true,
-            },
+            omit: sensitiveFields,
         })
     }
 
@@ -183,9 +224,7 @@ export class UsersService {
             where: {
                 id: id,
             },
-            omit: {
-                password: true,
-            },
+            omit: sensitiveFields,
         })
 
         if (!user) {
@@ -232,23 +271,46 @@ export class UsersService {
         }
     }
 
-    async findOneByApiKey(apiKey: string) {
-        const encryptedApiKey = this.cryptoService.encrypt(apiKey)
-
+    async findOneByStripeCustomerId(stripeCustomerId: string) {
         const user = await this.prisma.user.findUnique({
             where: {
-                apiKey: encryptedApiKey,
+                stripeCustomerId: stripeCustomerId,
             },
+            include: {
+                subscription: true,
+            },
+            omit: sensitiveFields,
         })
 
         if (!user) {
             throw new NotFoundException(
                 messagesHelper.OBJECT_NOT_FOUND({
                     name: "User",
-                    property: "apiKey",
-                    value: apiKey,
+                    property: "stripeCustomerId",
+                    value: stripeCustomerId,
                 }),
             )
+        }
+
+        return user
+    }
+
+    async safeFindOneByApiKey(apiKey: string) {
+        const encryptedApiKey = this.cryptoService.encrypt(apiKey)
+
+        return await this.prisma.user.findUnique({
+            where: {
+                apiKey: encryptedApiKey,
+            },
+        })
+    }
+
+    async findOneByApiKey(apiKey: string) {
+        const user = await this.safeFindOneByApiKey(apiKey)
+
+        if (!user) {
+            // Não inclui a chave na mensagem para não ecoar segredos em respostas/logs.
+            throw new NotFoundException(messagesHelper.INVALID_API_KEY)
         }
 
         return user
@@ -313,6 +375,7 @@ export class UsersService {
             data: {
                 ...updateUserDto,
             },
+            omit: sensitiveFields,
         })
     }
 
@@ -337,6 +400,12 @@ export class UsersService {
             },
             select: {
                 id: true,
+                subscription: {
+                    select: {
+                        externalId: true,
+                        status: true,
+                    },
+                },
             },
         })
 
@@ -348,6 +417,19 @@ export class UsersService {
                     value: id,
                 }),
             )
+        }
+
+        // Cancela a assinatura no Stripe antes de excluir o usuário, senão ele continuaria sendo cobrado.
+        const subscription = existingUser.subscription
+
+        if (subscription && !["canceled", "incomplete_expired"].includes(subscription.status)) {
+            try {
+                await this.stripe.subscriptions.cancel(subscription.externalId)
+            } catch (error: any) {
+                if (error?.code !== "resource_missing") {
+                    throw error
+                }
+            }
         }
 
         await this.prisma.user.delete({

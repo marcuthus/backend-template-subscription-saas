@@ -1,5 +1,7 @@
 import { Test, TestingModule } from "@nestjs/testing"
 
+import { ConfigService } from "@nestjs/config"
+
 import { MailerService } from "./mailer.service"
 
 describe("MailerService", () => {
@@ -7,7 +9,7 @@ describe("MailerService", () => {
 
     beforeEach(async () => {
         const module: TestingModule = await Test.createTestingModule({
-            providers: [MailerService],
+            providers: [MailerService, { provide: ConfigService, useValue: { getOrThrow: () => "api-key" } }],
         }).compile()
 
         service = module.get<MailerService>(MailerService)
