@@ -22,6 +22,8 @@ import { UsersService } from "../users/users.service"
 import { User } from "../generated/prisma/client"
 import { SignUpDto } from "./dto/sign-up.dto"
 
+type TokenUser = Pick<User, "id" | "email" | "username" | "role" | "name">
+
 @Injectable()
 export class AuthService {
     private readonly refreshSignExpiresIn: StringValue
@@ -36,7 +38,7 @@ export class AuthService {
         this.refreshSignExpiresIn = configService.getOrThrow<StringValue>("REFRESH_SIGN_EXPIRES_IN")
     }
 
-    async signIn(user: User) {
+    private generateTokens(user: TokenUser) {
         const accessPayload = {
             sub: user.id,
             email: user.email,
@@ -59,9 +61,19 @@ export class AuthService {
         }
     }
 
-    async signUp(signUpDto: SignUpDto) {
-        const planId = signUpDto.planId || configHelper.plans.free.id
+    /**
+     * O token de reset de senha é assinado com um segredo derivado do hash da senha atual,
+     * então ele deixa de ser válido assim que a senha é alterada (uso único).
+     */
+    private getResetPasswordSecret(user: Pick<User, "password">) {
+        return `${this.configService.getOrThrow<string>("JWT_PRIVATE_KEY")}:${user.password ?? ""}`
+    }
 
+    /**
+     * No cadastro só é permitido o plano gratuito. Planos pagos precisam passar pelo
+     * checkout do Stripe (POST /subscriptions/checkout) para que o pagamento seja garantido.
+     */
+    private resolveSignUpPlanId(planId?: string) {
         if (planId === configHelper.plans.admin.id) {
             throw new NotFoundException(
                 messagesHelper.OBJECT_NOT_FOUND({
@@ -72,6 +84,19 @@ export class AuthService {
             )
         }
 
+        if (planId && planId !== configHelper.plans.free.id) {
+            throw new BadRequestException(messagesHelper.PAID_PLAN_REQUIRES_CHECKOUT)
+        }
+
+        return configHelper.plans.free.id
+    }
+
+    async signIn(user: User) {
+        return this.generateTokens(user)
+    }
+
+    async signUp(signUpDto: SignUpDto) {
+        const planId = this.resolveSignUpPlanId(signUpDto.planId)
         return await this.usersService.create({ ...signUpDto, planId: planId })
     }
 
@@ -93,26 +118,7 @@ export class AuthService {
             )
         }
 
-        const accessPayload = {
-            sub: user.id,
-            email: user.email,
-            username: user.username,
-            role: user.role,
-            name: user.name,
-            type: "access",
-        } satisfies JwtAccessPayload
-
-        const refreshPayload = {
-            sub: user.id,
-            type: "refresh",
-        } satisfies JwtRefreshPayload
-
-        return {
-            accessToken: this.jwtService.sign(accessPayload),
-            refreshToken: this.jwtService.sign(refreshPayload, {
-                expiresIn: this.refreshSignExpiresIn,
-            }),
-        }
+        return this.generateTokens(user)
     }
 
     private async checkIfUserExistsForSupabaseSignUp(supabaseId: string, email: string): Promise<void> {
@@ -136,29 +142,19 @@ export class AuthService {
             throw new BadRequestException(messagesHelper.OAUTH_ACCOUNT_WITHOUT_EMAIL)
         }
 
+        const planId = this.resolveSignUpPlanId(signUpWithSupabaseDto.planId)
+
         await this.checkIfUserExistsForSupabaseSignUp(supabaseId, email)
 
         const userName = metadata?.name ?? signUpWithSupabaseDto.name ?? "Unknown User"
-        const generatedUsernasme = generateUsername(userName)
-
-        if (signUpWithSupabaseDto.planId === configHelper.plans.admin.id) {
-            throw new NotFoundException(
-                messagesHelper.OBJECT_NOT_FOUND({
-                    name: "Plan",
-                    property: "id",
-                    value: signUpWithSupabaseDto.planId,
-                }),
-            )
-        }
-
-        const planId = signUpWithSupabaseDto.planId || configHelper.plans.free.id
+        const generatedUsername = generateUsername(userName)
 
         return await this.usersService.create({
             email: email,
             name: userName,
             supabaseId: supabaseId,
             planId: planId,
-            username: generatedUsernasme,
+            username: generatedUsername,
         })
     }
 
@@ -166,39 +162,24 @@ export class AuthService {
         let payload: JwtRefreshPayload
 
         try {
-            payload = this.jwtService.verify<JwtRefreshPayload>(refreshToken, {
-                secret: this.configService.getOrThrow<string>("JWT_PRIVATE_KEY"),
-            })
+            payload = this.jwtService.verify<JwtRefreshPayload>(refreshToken)
         } catch (error) {
             throw new UnauthorizedException(messagesHelper.INVALID_AUTHORIZATION_TOKEN)
         }
 
-        if (payload.sub !== userId) {
+        if (payload.type !== "refresh" || payload.sub !== userId) {
             throw new UnauthorizedException(messagesHelper.INVALID_AUTHORIZATION_TOKEN)
         }
 
-        const user = await this.usersService.findOne(payload.sub)
+        let user: TokenUser
 
-        const accessPayload = {
-            sub: user.id,
-            email: user.email,
-            username: user.username,
-            role: user.role,
-            name: user.name,
-            type: "access",
-        } satisfies JwtAccessPayload
-
-        const newRefreshPayload = {
-            sub: user.id,
-            type: "refresh",
-        } satisfies JwtRefreshPayload
-
-        return {
-            accessToken: this.jwtService.sign(accessPayload),
-            refreshToken: this.jwtService.sign(newRefreshPayload, {
-                expiresIn: this.refreshSignExpiresIn,
-            }),
+        try {
+            user = await this.usersService.findOne(payload.sub)
+        } catch (error) {
+            throw new UnauthorizedException(messagesHelper.INVALID_AUTHORIZATION_TOKEN)
         }
+
+        return this.generateTokens(user)
     }
 
     async forgotPassword({ email }: ForgotPasswordDto) {
@@ -207,25 +188,48 @@ export class AuthService {
         if (!user) return
 
         const payload = {
-            sub: email,
+            sub: user.email,
             type: "forgot_password",
         } satisfies JwtForgotPasswordPayload
 
         const token = this.jwtService.sign(payload, {
             expiresIn: "1h",
+            secret: this.getResetPasswordSecret(user),
         })
 
+        const resetUrl = new URL(configHelper.frontend.resetPasswordPath, configHelper.frontend.url)
+        resetUrl.searchParams.set("token", token)
+
         await this.mailerService.send({
-            to: payload.sub,
-            subject: "Your password has been reset",
+            to: user.email,
+            subject: "Redefinição de senha",
             senderEmail: this.configService.getOrThrow<string>("BREVO_SENDER_EMAIL"),
-            htmlContent: `<p>Click <a href="#/reset-password?token=${token}">here</a> to reset your password.</p>`,
+            htmlContent: `<p>Clique <a href="${resetUrl.toString()}">aqui</a> para redefinir sua senha. O link expira em 1 hora.</p>`,
         })
     }
 
     async resetPassword(resetPasswordDto: ResetPasswordDto) {
-        const payload = this.jwtService.verify<JwtForgotPasswordPayload>(resetPasswordDto.token)
-        await this.usersService.resetPassword(payload.sub, resetPasswordDto.password)
+        const decoded = this.jwtService.decode<JwtForgotPasswordPayload | null>(resetPasswordDto.token)
+
+        if (!decoded || decoded.type !== "forgot_password" || typeof decoded.sub !== "string") {
+            throw new UnauthorizedException(messagesHelper.INVALID_AUTHORIZATION_TOKEN)
+        }
+
+        const user = await this.usersService.safeFindOneByEmail(decoded.sub)
+
+        if (!user) {
+            throw new UnauthorizedException(messagesHelper.INVALID_AUTHORIZATION_TOKEN)
+        }
+
+        try {
+            this.jwtService.verify<JwtForgotPasswordPayload>(resetPasswordDto.token, {
+                secret: this.getResetPasswordSecret(user),
+            })
+        } catch (error) {
+            throw new UnauthorizedException(messagesHelper.INVALID_AUTHORIZATION_TOKEN)
+        }
+
+        await this.usersService.resetPassword(user.email, resetPasswordDto.password)
     }
 
     async validateUser(email: string, password: string): Promise<UserWithoutSensitiveInfo | null> {
@@ -247,7 +251,7 @@ export class AuthService {
             return null
         }
 
-        const { password: _, ...rest } = user
+        const { password: _, apiKey: __, ...rest } = user
 
         return rest
     }
@@ -263,12 +267,14 @@ export class AuthService {
     }
 
     async validateApiKey(apiKey: string) {
-        const user = await this.usersService.findOneByApiKey(apiKey)
+        const user = await this.usersService.safeFindOneByApiKey(apiKey)
 
         if (!user) {
             return null
         }
 
-        return user
+        const { password: _, apiKey: __, ...rest } = user
+
+        return rest
     }
 }

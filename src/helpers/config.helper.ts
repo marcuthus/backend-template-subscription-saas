@@ -26,6 +26,13 @@ export const configHelper = {
             credentials: true,
         },
     },
+    frontend: {
+        url: process.env.FRONTEND_URL || "http://localhost:3000",
+        resetPasswordPath: "/reset-password",
+        checkoutSuccessPath: "/billing/success",
+        checkoutCancelPath: "/billing/cancel",
+        billingPortalReturnPath: "/billing",
+    },
     pagination: {
         minPage: 1,
         defaultPage: 1,

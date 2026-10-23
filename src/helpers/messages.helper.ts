@@ -38,4 +38,10 @@ export const messagesHelper = {
     INVALID_SUPABASE_AUTH_TOKEN: "Token de autenticação Supabase inválido!",
     UNEXPECTED_ERROR: "Um erro inesperado aconteceu, tente novamente mais tarde!",
     OAUTH_ACCOUNT_ALREADY_EXISTS: "A conta com o email fornecido já existe!",
+    PAID_PLAN_REQUIRES_CHECKOUT:
+        "Planos pagos não podem ser escolhidos no cadastro. Crie a conta no plano gratuito e faça o upgrade pelo checkout.",
+    PLAN_NOT_PURCHASABLE: "Este plano não pode ser contratado pelo checkout!",
+    ALREADY_SUBSCRIBED_TO_PLAN: "Você já possui uma assinatura ativa deste plano!",
+    SUBSCRIPTION_NOT_FOUND: "Nenhuma assinatura foi encontrada para este usuário!",
+    STRIPE_CUSTOMER_NOT_FOUND: "Este usuário não possui um cliente vinculado no Stripe!",
 } satisfies Record<string, Message>

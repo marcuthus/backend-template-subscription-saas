@@ -21,7 +21,8 @@ import { AuthService } from "./auth.service"
         forwardRef(() => UsersModule),
         JwtModule.registerAsync({
             useFactory: (configService: ConfigService) => ({
-                privateKey: configService.getOrThrow<string>("JWT_PRIVATE_KEY"),
+                // "secret" é usado tanto para assinar quanto para verificar (HS256). Com "privateKey" o verify() falhava.
+                secret: configService.getOrThrow<string>("JWT_PRIVATE_KEY"),
                 signOptions: { expiresIn: configService.getOrThrow<StringValue>("ACCESS_SIGN_EXPIRES_IN") },
             }),
             inject: [ConfigService],
