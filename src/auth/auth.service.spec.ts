@@ -164,6 +164,36 @@ describe("AuthService", () => {
         })
     })
 
+    describe("signInWithSupabase", () => {
+        const mockSupabaseUser = (user: Record<string, any>) => {
+            jest.spyOn(service, "verifySupabaseToken").mockResolvedValue(user as any)
+        }
+
+        beforeEach(() => {
+            usersService.safeFindOneBySupabaseId = jest.fn().mockResolvedValue(null)
+        })
+
+        it("não vincula por email quando o email não foi confirmado no Supabase", async () => {
+            mockSupabaseUser({ id: "supa-attacker", email: storedUser.email, email_confirmed_at: null })
+
+            await expect(service.signInWithSupabase({ token: "x" })).rejects.toBeInstanceOf(NotFoundException)
+        })
+
+        it("não vincula por email quando a conta já pertence a outra identidade Supabase", async () => {
+            storedUser.supabaseId = "supa-owner"
+            mockSupabaseUser({ id: "supa-attacker", email: storedUser.email, email_confirmed_at: "2026-01-01" })
+
+            await expect(service.signInWithSupabase({ token: "x" })).rejects.toBeInstanceOf(NotFoundException)
+        })
+
+        it("vincula por email confirmado quando a conta local não tem identidade Supabase", async () => {
+            storedUser.supabaseId = null
+            mockSupabaseUser({ id: "supa-1", email: storedUser.email, email_confirmed_at: "2026-01-01" })
+
+            await expect(service.signInWithSupabase({ token: "x" })).resolves.toHaveProperty("accessToken")
+        })
+    })
+
     describe("validateApiKey", () => {
         it("não expõe senha nem a chave criptografada", async () => {
             usersService.safeFindOneByApiKey.mockResolvedValue(storedUser)

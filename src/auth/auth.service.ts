@@ -101,12 +101,22 @@ export class AuthService {
     }
 
     async signInWithSupabase(loginWithSupabaseDto: SignInWithSupabaseDto) {
-        const { id: supabaseId, email } = await this.verifySupabaseToken(loginWithSupabaseDto.token)
+        const {
+            id: supabaseId,
+            email,
+            email_confirmed_at: emailConfirmedAt,
+        } = await this.verifySupabaseToken(loginWithSupabaseDto.token)
 
         const foundUserBySubaseId = await this.usersService.safeFindOneBySupabaseId(supabaseId)
-        const foundUserByEmail = email ? await this.usersService.safeFindOneByEmail(email) : null
 
-        const user = foundUserBySubaseId || foundUserByEmail
+        // Só vincula pelo email se ele foi confirmado no Supabase e a conta local não pertence
+        // a outra identidade Supabase; senão qualquer um com o email da vítima entraria na conta dela.
+        const foundUserByEmail =
+            !foundUserBySubaseId && email && emailConfirmedAt ? await this.usersService.safeFindOneByEmail(email) : null
+
+        const canLinkByEmail = !!foundUserByEmail && !foundUserByEmail.supabaseId
+
+        const user = foundUserBySubaseId || (canLinkByEmail ? foundUserByEmail : null)
 
         if (!user) {
             throw new NotFoundException(
