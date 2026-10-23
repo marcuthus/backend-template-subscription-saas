@@ -1,6 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common"
 import { ConfigService } from "@nestjs/config"
-import * as Brevo from "@getbrevo/brevo"
+import { BrevoClient } from "@getbrevo/brevo"
 
 import { configHelper } from "../helpers/config.helper"
 
@@ -19,13 +19,12 @@ export type SendCreatedAccountEmail = {
 
 @Injectable()
 export class MailerService {
-    private readonly apiInstance: Brevo.TransactionalEmailsApi
+    private readonly client: BrevoClient
     private readonly logger = new Logger(MailerService.name)
 
     constructor(private config: ConfigService) {
         const apiKey = this.config.getOrThrow<string>("BREVO_API_KEY")
-        this.apiInstance = new Brevo.TransactionalEmailsApi()
-        this.apiInstance.setApiKey(0, apiKey)
+        this.client = new BrevoClient({ apiKey: apiKey })
     }
 
     async send({ htmlContent, subject, to, senderEmail, senderName }: SendEmailOptions): Promise<boolean> {
@@ -35,7 +34,7 @@ export class MailerService {
                 name: senderName || configHelper.app.metadata.name,
             }
 
-            await this.apiInstance.sendTransacEmail({
+            await this.client.transactionalEmails.sendTransacEmail({
                 sender: sender,
                 to: [
                     {
